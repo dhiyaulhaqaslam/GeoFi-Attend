@@ -4,8 +4,6 @@ import AttendanceHistory from './components/AttendanceHistory';
 import AdminDashboard from './components/AdminDashboard';
 import './App.css';
 
-const API_BASE = '';
-
 interface Office {
     id: number;
     name: string;
@@ -15,12 +13,21 @@ interface Office {
     address: string;
 }
 
+type Role = 'employee' | 'admin';
+
 interface User {
     id: number;
     username: string;
     name: string;
-    role: 'employee' | 'admin';
+    role: Role;
 }
+
+const MOCK_USERS: User[] = [
+    { id: 1, username: 'admin', name: 'Administrator', role: 'admin' },
+    { id: 2, username: 'pegawai1', name: 'Pegawai Satu', role: 'employee' },
+    { id: 3, username: 'pegawai2', name: 'Pegawai Dua', role: 'employee' },
+    { id: 4, username: 'pegawai3', name: 'Pegawai Tiga', role: 'employee' },
+];
 
 export default function App() {
     const [currentUser, setCurrentUser] = useState<User | null>(null);
@@ -32,11 +39,7 @@ export default function App() {
         const init = async () => {
             const userId = localStorage.getItem('userId');
             if (userId) {
-                const mockUsers: User[] = [
-                    { id: 1, username: 'admin', name: 'Administrator', role: 'admin' },
-                    { id: 2, username: 'pegawai1', name: 'Pegawai Satu', role: 'employee' }
-                ];
-                const user = mockUsers.find(u => u.id === parseInt(userId, 10));
+                const user = MOCK_USERS.find(u => u.id === parseInt(userId, 10));
                 if (user) setCurrentUser(user);
             }
 
@@ -49,25 +52,20 @@ export default function App() {
 
     const loadOffices = async () => {
         try {
-            const res = await fetch(`${API_BASE}/api/attendance/offices`);
+            const res = await fetch('/api/attendance/offices');
             if (!res.ok) {
-                console.error("Failed to load offices:", res.status);
+                console.error('Failed to load offices:', res.status);
                 return;
             }
             const data: Office[] = await res.json();
             setOffices(data);
         } catch (e) {
-            console.error("Error loading offices:", e);
+            console.error('Error loading offices:', e);
         }
     };
 
-
     const handleLogin = (userId: number) => {
-        const mockUsers: User[] = [
-            { id: 1, username: 'admin', name: 'Administrator', role: 'admin' },
-            { id: 2, username: 'pegawai1', name: 'Pegawai Satu', role: 'employee' }
-        ];
-        const user = mockUsers.find(u => u.id === userId);
+        const user = MOCK_USERS.find(u => u.id === userId);
         if (user) {
             setCurrentUser(user);
             localStorage.setItem('userId', String(userId));
@@ -129,6 +127,8 @@ function LoginForm({ onLogin }: { onLogin: (userId: number) => void }) {
                         <select value={selectedUser} onChange={(e) => setSelectedUser(parseInt(e.target.value, 10))}>
                             <option value={1}>Administrator</option>
                             <option value={2}>Pegawai Satu</option>
+                            <option value={3}>Pegawai Dua</option>
+                            <option value={4}>Pegawai Tiga</option>
                         </select>
                     </div>
                     <button type="submit" className="login-btn">Login</button>

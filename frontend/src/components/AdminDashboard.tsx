@@ -1,20 +1,18 @@
-import React, { useEffect, useMemo, useState } from 'react';
-import axios from 'axios';
-import './AdminDashboard.css';
+import React, { useEffect, useMemo, useState } from "react";
+import axios from "axios";
+import "./AdminDashboard.css";
 
 interface AttendanceRecord {
   id: number;
   user_id: number;
   office_id: number;
-  type: 'checkin' | 'checkout';
+  type: "checkin" | "checkout";
   timestamp: string;
   latitude: number;
   longitude: number;
   distance_to_office_m: number;
-  geofence_status: 'PASS' | 'FAIL';
-  wifi_ssid?: string;
-  wifi_bssid?: string;
-  wifi_status: 'PASS' | 'FAIL' | 'NOT_CHECKED';
+  geofence_status: "PASS" | "FAIL";
+  wifi_status: "PASS" | "FAIL" | "NOT_CHECKED";
   ip_address?: string;
   user_agent: string;
   notes?: string;
@@ -35,122 +33,141 @@ interface User {
   id: number;
   name: string;
   username: string;
-  role: 'employee' | 'admin';
+  role: "employee" | "admin";
 }
 
-const API_BASE =
-  (process.env.REACT_APP_API_BASE as string) ||
-  (window.location.hostname === 'localhost'
-    ? 'http://localhost:3001'
-    : `http://${window.location.hostname}:3001`);
+type FilterOffice = number | "all";
+type FilterUser = number | "all";
 
-const AdminDashboard: React.FC = () => {
+interface AdminDashboardProps {
+  // kalau kamu sudah punya state login, lempar adminUserId dari App
+  adminUserId?: number;
+}
+
+const AdminDashboard: React.FC<AdminDashboardProps> = ({ adminUserId = 1 }) => {
   const [records, setRecords] = useState<AttendanceRecord[]>([]);
   const [offices, setOffices] = useState<Office[]>([]);
   const [users, setUsers] = useState<User[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  const [selectedOffice, setSelectedOffice] = useState<number | 'all'>('all');
-  const [selectedUser, setSelectedUser] = useState<number | 'all'>('all');
-  const [dateFilter, setDateFilter] = useState<string>('');
+  const [selectedOffice, setSelectedOffice] = useState<FilterOffice>("all");
+  const [selectedUser, setSelectedUser] = useState<FilterUser>("all");
+  const [dateFilter, setDateFilter] = useState<string>("");
 
-  useEffect(() => {
-    loadData();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  const headers = useMemo(() => ({ "user-id": adminUserId.toString() }), [adminUserId]);
 
-  const loadData = async () => {
+  const loadOffices = async () => {
+    const r = await axios.get("/api/attendance/offices");
+    setOffices(r.data ?? []);
+  };
+
+  const loadUsers = async () => {
+    const r = await axios.get("/api/attendance/admin/users", { headers });
+    if (r.data?.success) setUsers(r.data.data ?? []);
+  };
+
+  const loadRecords = async () => {
+    const qs = new URLSearchParams();
+    qs.set("limit", "1000");
+    qs.set("offset", "0");
+
+    if (selectedOffice !== "all") qs.set("officeId", String(selectedOffice));
+    if (selectedUser !== "all") qs.set("userId", String(selectedUser));
+    if (dateFilter) qs.set("date", dateFilter);
+
+    const r = await axios.get(`/api/attendance/admin/records?${qs.toString()}`, { headers });
+    if (r.data?.success) setRecords(r.data.data ?? []);
+  };
+
+  const loadAll = async () => {
     try {
       setLoading(true);
       setError(null);
 
-      // Load offices
-      const officesResponse = await axios.get(`${API_BASE}/api/attendance/offices`);
-      setOffices(officesResponse.data || []);
-
-      // Demo users
-      const demoUsers: User[] = [
-        { id: 1, name: 'Administrator', username: 'admin', role: 'admin' },
-        { id: 2, name: 'Pegawai Satu', username: 'pegawai1', role: 'employee' },
-      ];
-      setUsers(demoUsers);
-
-      // Load records for each user (demo)
-      const allRecords: AttendanceRecord[] = [];
-      for (const user of demoUsers) {
-        try {
-          const response = await axios.get(`${API_BASE}/api/attendance/records?limit=100`, {
-            headers: { 'user-id': user.id.toString() },
-          });
-          if (response.data?.success) {
-            allRecords.push(...(response.data.data || []));
-          }
-        } catch {
-          // ignore per-user
-        }
-      }
-
-      setRecords(
-        allRecords.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
-      );
-    } catch (error: any) {
-      const errorMessage = error?.response?.data?.error || 'Gagal memuat data dashboard';
-      setError(errorMessage);
+      await Promise.all([loadOffices(), loadUsers()]);
+      await loadRecords();
+    } catch (e: any) {
+      const msg = e?.response?.data?.error || "Gagal memuat data dashboard admin";
+      setError(msg);
     } finally {
       setLoading(false);
     }
   };
 
-  const filteredRecords = useMemo(() => {
-    return records.filter((record) => {
-      if (selectedOffice !== 'all' && record.office_id !== selectedOffice) return false;
-      if (selectedUser !== 'all' && record.user_id !== selectedUser) return false;
-      if (dateFilter && !record.timestamp.startsWith(dateFilter)) return false;
-      return true;
-    });
-  }, [records, selectedOffice, selectedUser, dateFilter]);
+  useEffect(() => {
+    loadAll();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [adminUserId]);
+
+  useEffect(() => {
+    // reload records ketika filter berubah
+    (async () => {
+      try {
+        setLoading(true);
+        setError(null);
+        await loadRecords();
+      } catch (e: any) {
+        const msg = e?.response?.data?.error || "Gagal memuat data records";
+        setError(msg);
+      } finally {
+        setLoading(false);
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedOffice, selectedUser, dateFilter]);
+
+  const filteredRecords = records;
+
+  const employeeCount = users.filter((u) => u.role === "employee").length;
+
+  const checkinToday = useMemo(() => {
+    const todayStr = new Date().toDateString();
+    return filteredRecords.filter(
+      (r) => r.type === "checkin" && new Date(r.timestamp).toDateString() === todayStr
+    ).length;
+  }, [filteredRecords]);
 
   const getAttendanceSummary = () => {
     const summary: { [key: string]: { checkins: number; checkouts: number; users: Set<number> } } = {};
 
     filteredRecords.forEach((record) => {
-      const date = new Date(record.timestamp).toISOString().split('T')[0];
+      const date = new Date(record.timestamp).toISOString().split("T")[0];
       if (!summary[date]) summary[date] = { checkins: 0, checkouts: 0, users: new Set() };
-
-      if (record.type === 'checkin') summary[date].checkins++;
+      if (record.type === "checkin") summary[date].checkins++;
       else summary[date].checkouts++;
-
       summary[date].users.add(record.user_id);
     });
 
-    return Object.entries(summary).sort(([a], [b]) => b.localeCompare(a)).slice(0, 30);
+    return Object.entries(summary)
+      .sort(([a], [b]) => b.localeCompare(a))
+      .slice(0, 30);
   };
 
   const exportToCSV = () => {
     const csvContent = [
-      ['Tanggal', 'Waktu', 'Nama', 'Jenis', 'Kantor', 'Koordinat', 'Jarak', 'Geofence', 'WiFi', 'IP'],
+      ["Tanggal", "Waktu", "Nama", "Jenis", "Kantor", "Koordinat", "Jarak", "Geofence", "WiFi", "IP"],
       ...filteredRecords.map((record) => [
-        new Date(record.timestamp).toLocaleDateString('id-ID'),
-        new Date(record.timestamp).toLocaleTimeString('id-ID'),
+        new Date(record.timestamp).toLocaleDateString("id-ID"),
+        new Date(record.timestamp).toLocaleTimeString("id-ID"),
         record.user_name,
-        record.type === 'checkin' ? 'Check-in' : 'Check-out',
+        record.type === "checkin" ? "Check-in" : "Check-out",
         record.office_name,
         `${record.latitude}, ${record.longitude}`,
-        record.distance_to_office_m,
+        String(record.distance_to_office_m),
         record.geofence_status,
         record.wifi_status,
-        record.ip_address || '',
+        record.ip_address || "",
       ]),
     ]
-      .map((row) => row.join(','))
-      .join('\n');
+      .map((row) => row.join(","))
+      .join("\n");
 
-    const blob = new Blob([csvContent], { type: 'text/csv' });
+    const blob = new Blob([csvContent], { type: "text/csv" });
     const url = window.URL.createObjectURL(blob);
-    const a = document.createElement('a');
+    const a = document.createElement("a");
     a.href = url;
-    a.download = `laporan-absensi-${new Date().toISOString().split('T')[0]}.csv`;
+    a.download = `laporan-absensi-${new Date().toISOString().split("T")[0]}.csv`;
     a.click();
     window.URL.revokeObjectURL(url);
   };
@@ -171,7 +188,7 @@ const AdminDashboard: React.FC = () => {
         </div>
         <div className="stat-card">
           <h3>Total Users</h3>
-          <div className="stat-number">{users.filter((u) => u.role === 'employee').length}</div>
+          <div className="stat-number">{employeeCount}</div>
         </div>
         <div className="stat-card">
           <h3>Kantor</h3>
@@ -179,11 +196,7 @@ const AdminDashboard: React.FC = () => {
         </div>
         <div className="stat-card">
           <h3>Check-in Hari Ini</h3>
-          <div className="stat-number">
-            {filteredRecords.filter(
-              (r) => r.type === 'checkin' && new Date(r.timestamp).toDateString() === new Date().toDateString()
-            ).length}
-          </div>
+          <div className="stat-number">{checkinToday}</div>
         </div>
       </div>
 
@@ -192,7 +205,7 @@ const AdminDashboard: React.FC = () => {
           <label>Kantor:</label>
           <select
             value={selectedOffice}
-            onChange={(e) => setSelectedOffice(e.target.value === 'all' ? 'all' : parseInt(e.target.value, 10))}
+            onChange={(e) => setSelectedOffice(e.target.value === "all" ? "all" : parseInt(e.target.value))}
           >
             <option value="all">Semua Kantor</option>
             {offices.map((office) => (
@@ -207,14 +220,16 @@ const AdminDashboard: React.FC = () => {
           <label>Pegawai:</label>
           <select
             value={selectedUser}
-            onChange={(e) => setSelectedUser(e.target.value === 'all' ? 'all' : parseInt(e.target.value, 10))}
+            onChange={(e) => setSelectedUser(e.target.value === "all" ? "all" : parseInt(e.target.value))}
           >
             <option value="all">Semua Pegawai</option>
-            {users.filter((u) => u.role === 'employee').map((user) => (
-              <option key={user.id} value={user.id}>
-                {user.name}
-              </option>
-            ))}
+            {users
+              .filter((u) => u.role === "employee")
+              .map((user) => (
+                <option key={user.id} value={user.id}>
+                  {user.name}
+                </option>
+              ))}
           </select>
         </div>
 
@@ -244,11 +259,11 @@ const AdminDashboard: React.FC = () => {
               {summary.map(([date, data]) => (
                 <tr key={date}>
                   <td>
-                    {new Date(date).toLocaleDateString('id-ID', {
-                      weekday: 'long',
-                      year: 'numeric',
-                      month: 'long',
-                      day: 'numeric',
+                    {new Date(date).toLocaleDateString("id-ID", {
+                      weekday: "long",
+                      year: "numeric",
+                      month: "long",
+                      day: "numeric",
                     })}
                   </td>
                   <td>{data.checkins}</td>
@@ -280,9 +295,9 @@ const AdminDashboard: React.FC = () => {
             <tbody>
               {filteredRecords.slice(0, 50).map((record) => (
                 <tr key={record.id}>
-                  <td>{new Date(record.timestamp).toLocaleString('id-ID')}</td>
+                  <td>{new Date(record.timestamp).toLocaleString("id-ID")}</td>
                   <td>{record.user_name}</td>
-                  <td className={record.type}>{record.type === 'checkin' ? 'Check-in' : 'Check-out'}</td>
+                  <td className={record.type}>{record.type === "checkin" ? "Check-in" : "Check-out"}</td>
                   <td>{record.office_name}</td>
                   <td>
                     {record.latitude.toFixed(4)}, {record.longitude.toFixed(4)}

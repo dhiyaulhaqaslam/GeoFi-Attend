@@ -10,13 +10,51 @@ import {
 
 const router = express.Router();
 
-// Demo auth: user-id header
-const authenticateUser = (req: Request, res: Response, next: NextFunction) => {
-   const userIdRaw = req.headers["user-id"] as string;
-   const userId = Number(userIdRaw);
-   if (!userId || Number.isNaN(userId))
-      return res.status(401).json({ error: "Authentication required" });
-   (req as any).userId = userId;
+type AuthUser = {
+   id: number;
+   username: string;
+   name: string;
+   role: "admin" | "employee";
+};
+
+// =====================
+// AUTH MIDDLEWARE
+// =====================
+const authenticateUser = async (
+   req: Request,
+   res: Response,
+   next: NextFunction
+) => {
+   try {
+      const userIdRaw = req.headers["user-id"] as string;
+      const userId = Number(userIdRaw);
+
+      if (!userId || Number.isNaN(userId)) {
+         return res.status(401).json({ error: "Authentication required" });
+      }
+
+      const user = await db.get<AuthUser>(
+         "SELECT id, username, name, role FROM users WHERE id = ?",
+         [userId]
+      );
+
+      if (!user) {
+         return res.status(401).json({ error: "User not found" });
+      }
+
+      (req as any).user = user;
+      next();
+   } catch (e) {
+      console.error("Auth error:", e);
+      return res.status(500).json({ error: "Internal server error" });
+   }
+};
+
+const requireAdmin = (req: Request, res: Response, next: NextFunction) => {
+   const user = (req as any).user as AuthUser | undefined;
+   if (!user) return res.status(401).json({ error: "Authentication required" });
+   if (user.role !== "admin")
+      return res.status(403).json({ error: "Admin only" });
    next();
 };
 
@@ -26,6 +64,13 @@ function parseNumberStrict(v: any): number | null {
    return n;
 }
 
+function parseIntQuery(v: any): number | null {
+   if (v === undefined || v === null || v === "") return null;
+   const n = Number(v);
+   if (!Number.isFinite(n)) return null;
+   return Math.trunc(n);
+}
+
 // ambil IP real (x-forwarded-for / req.ip)
 function getClientIp(req: Request): string {
    const xf = req.headers["x-forwarded-for"] as string | undefined;
@@ -33,7 +78,9 @@ function getClientIp(req: Request): string {
    return normalizeIp(req.ip);
 }
 
-// Get office information
+// =====================
+// PUBLIC: OFFICES
+// =====================
 router.get("/offices", async (_req, res) => {
    try {
       const offices = await db.all<Office>(
@@ -46,7 +93,93 @@ router.get("/offices", async (_req, res) => {
    }
 });
 
-// Internal validator for both checkin/checkout
+// =====================
+// ADMIN: USERS + RECORDS
+// =====================
+router.get(
+   "/admin/users",
+   authenticateUser,
+   requireAdmin,
+   async (_req, res) => {
+      try {
+         const users = await db.all<AuthUser>(
+            "SELECT id, username, name, role FROM users ORDER BY id"
+         );
+         res.json({ success: true, data: users });
+      } catch (e) {
+         console.error("Admin users error:", e);
+         res.status(500).json({ error: "Internal server error" });
+      }
+   }
+);
+
+router.get(
+   "/admin/records",
+   authenticateUser,
+   requireAdmin,
+   async (req, res) => {
+      try {
+         const limit = Math.min(Number(req.query.limit ?? 500), 2000);
+         const offset = Number(req.query.offset ?? 0);
+
+         const officeId = parseIntQuery(req.query.officeId);
+         const userId = parseIntQuery(req.query.userId);
+         const date = (req.query.date as string | undefined) ?? "";
+
+         const where: string[] = [];
+         const params: any[] = [];
+
+         if (officeId) {
+            where.push("ar.office_id = ?");
+            params.push(officeId);
+         }
+         if (userId) {
+            where.push("ar.user_id = ?");
+            params.push(userId);
+         }
+         if (date) {
+            // expect YYYY-MM-DD
+            where.push("DATE(ar.timestamp) = ?");
+            params.push(date);
+         }
+
+         const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+
+         const totalRow = await db.get<{ total: number }>(
+            `SELECT COUNT(*) as total
+       FROM attendance_records ar
+       ${whereSql}`,
+            params
+         );
+
+         const records = await db.all<any>(
+            `SELECT ar.*,
+              o.name as office_name,
+              u.name as user_name
+       FROM attendance_records ar
+       JOIN offices o ON ar.office_id = o.id
+       JOIN users u ON ar.user_id = u.id
+       ${whereSql}
+       ORDER BY ar.timestamp DESC
+       LIMIT ? OFFSET ?`,
+            [...params, limit, offset]
+         );
+
+         res.json({
+            success: true,
+            total: totalRow?.total ?? 0,
+            data: records,
+         });
+      } catch (e) {
+         console.error("Admin records error:", e);
+         res.status(500).json({ error: "Internal server error" });
+      }
+   }
+);
+
+// =====================
+// INTERNAL VALIDATOR
+// =====================
 async function validateRequest(
    req: Request,
    officeId: number,
@@ -93,7 +226,7 @@ async function validateRequest(
 
    const clientIP = getClientIp(req);
 
-   // jika whitelist kosong => FAIL (biar tidak jadi bebas)
+   // jika whitelist kosong => FAIL
    const networkPass = cidrs.length > 0 && isIPInOfficeNetwork(clientIP, cidrs);
    if (!networkPass) {
       return {
@@ -117,10 +250,13 @@ async function validateRequest(
    };
 }
 
-// Check-in
+// =====================
+// CHECK-IN
+// =====================
 router.post("/checkin", authenticateUser, async (req, res) => {
    try {
-      const userId = (req as any).userId as number;
+      const user = (req as any).user as AuthUser;
+      const userId = user.id;
 
       const lat = parseNumberStrict(req.body.latitude);
       const lng = parseNumberStrict(req.body.longitude);
@@ -128,11 +264,9 @@ router.post("/checkin", authenticateUser, async (req, res) => {
       const accuracy = parseNumberStrict(req.body.accuracy_m);
 
       if (lat === null || lng === null || officeId === null) {
-         return res
-            .status(400)
-            .json({
-               error: "Missing required fields: latitude, longitude, officeId",
-            });
+         return res.status(400).json({
+            error: "Missing required fields: latitude, longitude, officeId",
+         });
       }
 
       if (lat < -90 || lat > 90 || lng < -180 || lng > 180) {
@@ -141,11 +275,9 @@ router.post("/checkin", authenticateUser, async (req, res) => {
 
       // optional: reject akurasi jelek
       if (accuracy !== null && accuracy > 80) {
-         return res
-            .status(400)
-            .json({
-               error: "Akurasi GPS terlalu rendah (>80m). Coba refresh lokasi.",
-            });
+         return res.status(400).json({
+            error: "Akurasi GPS terlalu rendah (>80m). Coba refresh lokasi.",
+         });
       }
 
       const validated = await validateRequest(req, officeId, lat, lng);
@@ -170,11 +302,9 @@ router.post("/checkin", authenticateUser, async (req, res) => {
       );
 
       if (existingCheckin) {
-         return res
-            .status(400)
-            .json({
-               error: "Anda sudah check-in hari ini. Silakan check-out dulu.",
-            });
+         return res.status(400).json({
+            error: "Anda sudah check-in hari ini. Silakan check-out dulu.",
+         });
       }
 
       const timestamp = getCurrentTimestamp();
@@ -191,7 +321,7 @@ router.post("/checkin", authenticateUser, async (req, res) => {
             lng,
             validated.geo.distance,
             validated.geo.status,
-            validated.wifi_status, // PASS = jaringan kantor valid
+            validated.wifi_status,
             validated.clientIP,
             validated.userAgent,
             accuracy !== null ? `accuracy_m=${accuracy}` : null,
@@ -220,10 +350,13 @@ router.post("/checkin", authenticateUser, async (req, res) => {
    }
 });
 
-// Check-out
+// =====================
+// CHECK-OUT
+// =====================
 router.post("/checkout", authenticateUser, async (req, res) => {
    try {
-      const userId = (req as any).userId as number;
+      const user = (req as any).user as AuthUser;
+      const userId = user.id;
 
       const lat = parseNumberStrict(req.body.latitude);
       const lng = parseNumberStrict(req.body.longitude);
@@ -231,11 +364,9 @@ router.post("/checkout", authenticateUser, async (req, res) => {
       const accuracy = parseNumberStrict(req.body.accuracy_m);
 
       if (lat === null || lng === null || officeId === null) {
-         return res
-            .status(400)
-            .json({
-               error: "Missing required fields: latitude, longitude, officeId",
-            });
+         return res.status(400).json({
+            error: "Missing required fields: latitude, longitude, officeId",
+         });
       }
 
       if (lat < -90 || lat > 90 || lng < -180 || lng > 180) {
@@ -243,11 +374,9 @@ router.post("/checkout", authenticateUser, async (req, res) => {
       }
 
       if (accuracy !== null && accuracy > 80) {
-         return res
-            .status(400)
-            .json({
-               error: "Akurasi GPS terlalu rendah (>80m). Coba refresh lokasi.",
-            });
+         return res.status(400).json({
+            error: "Akurasi GPS terlalu rendah (>80m). Coba refresh lokasi.",
+         });
       }
 
       const validated = await validateRequest(req, officeId, lat, lng);
@@ -272,11 +401,9 @@ router.post("/checkout", authenticateUser, async (req, res) => {
       );
 
       if (!activeCheckin) {
-         return res
-            .status(400)
-            .json({
-               error: "Tidak ada check-in aktif hari ini. Silakan check-in dulu.",
-            });
+         return res.status(400).json({
+            error: "Tidak ada check-in aktif hari ini. Silakan check-in dulu.",
+         });
       }
 
       const timestamp = getCurrentTimestamp();
@@ -322,10 +449,14 @@ router.post("/checkout", authenticateUser, async (req, res) => {
    }
 });
 
-// Get user's attendance records
+// =====================
+// USER: RECORDS (HANYA USER ITU)
+// =====================
 router.get("/records", authenticateUser, async (req, res) => {
    try {
-      const userId = (req as any).userId as number;
+      const user = (req as any).user as AuthUser;
+      const userId = user.id;
+
       const limit = Number(req.query.limit ?? 50);
       const offset = Number(req.query.offset ?? 0);
 
@@ -345,50 +476,6 @@ router.get("/records", authenticateUser, async (req, res) => {
       res.json({ success: true, data: records });
    } catch (error) {
       console.error("Error fetching attendance records:", error);
-      res.status(500).json({ error: "Internal server error" });
-   }
-});
-
-// Get attendance summary for user
-router.get("/summary", authenticateUser, async (req, res) => {
-   try {
-      const userId = (req as any).userId as number;
-      const { month, year } = req.query;
-
-      const currentDate = new Date();
-      const targetMonth = month
-         ? parseInt(month as string)
-         : currentDate.getMonth() + 1;
-      const targetYear = year
-         ? parseInt(year as string)
-         : currentDate.getFullYear();
-
-      const summary = await db.all(
-         `SELECT
-        DATE(timestamp) as date,
-        COUNT(CASE WHEN type = 'checkin' THEN 1 END) as checkins,
-        COUNT(CASE WHEN type = 'checkout' THEN 1 END) as checkouts,
-        MIN(CASE WHEN type = 'checkin' THEN timestamp END) as first_checkin,
-        MAX(CASE WHEN type = 'checkout' THEN timestamp END) as last_checkout
-       FROM attendance_records
-       WHERE user_id = ?
-       AND strftime('%m', timestamp) = ?
-       AND strftime('%Y', timestamp) = ?
-       GROUP BY DATE(timestamp)
-       ORDER BY date DESC`,
-         [
-            userId,
-            targetMonth.toString().padStart(2, "0"),
-            targetYear.toString(),
-         ]
-      );
-
-      res.json({
-         success: true,
-         data: { month: targetMonth, year: targetYear, summary },
-      });
-   } catch (error) {
-      console.error("Error fetching attendance summary:", error);
       res.status(500).json({ error: "Internal server error" });
    }
 });

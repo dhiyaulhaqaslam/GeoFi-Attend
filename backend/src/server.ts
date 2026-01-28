@@ -3,23 +3,17 @@ import cors from "cors";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import attendanceRoutes from "./routes/attendance";
+import seedRoutes from "./routes/seed";
 import { db } from "./database";
 
 const app = express();
-app.set("trust proxy", 0); 
+app.set("trust proxy", 0);
 
 const PORT = process.env.PORT || 3001;
 
-// Security middleware
 app.use(helmet());
-app.use(
-   cors({
-      origin: true,
-      credentials: true,
-   })
-);
+app.use(cors({ origin: true, credentials: true }));
 
-// Rate limiting
 const limiter = rateLimit({
    windowMs: 15 * 60 * 1000,
    limit: 100,
@@ -28,7 +22,6 @@ const limiter = rateLimit({
 });
 app.use("/api/", limiter);
 
-// Body parsing middleware
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true }));
 
@@ -36,8 +29,11 @@ app.get("/health", (_req, res) => {
    res.json({ status: "OK", timestamp: new Date().toISOString() });
 });
 
+// routes
+app.use("/api/seed", seedRoutes);
 app.use("/api/attendance", attendanceRoutes);
 
+// error handler (setelah routes)
 app.use(
    (
       err: Error,
@@ -70,4 +66,3 @@ app.listen(PORT, () => {
    console.log(`Server is running on port ${PORT}`);
    console.log(`Health check available at http://localhost:${PORT}/health`);
 });
-

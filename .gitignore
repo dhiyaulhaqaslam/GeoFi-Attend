@@ -1,0 +1,52 @@
+# --- dependencies ---
+**/node_modules/
+**/.pnp/
+**/.pnp.js
+
+# --- build outputs ---
+**/dist/
+**/build/
+**/.next/
+**/.out/
+
+# --- logs ---
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+**/*.log
+
+# --- env / secrets ---
+**/.env
+**/.env.*
+!**/.env.example
+
+# --- caches ---
+**/.cache/
+**/.eslintcache
+**/.parcel-cache/
+**/.turbo/
+**/.vite/
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.iml
+
+# --- TypeScript ---
+**/*.tsbuildinfo
+
+# --- testing ---
+**/coverage/
+
+# --- local database / sqlite ---
+**/*.sqlite
+**/*.sqlite3
+**/database.sqlite
+**/db.sqlite
+
+# --- uploads / temp (sesuaikan jika ada folder upload) ---
+**/uploads/
+**/tmp/

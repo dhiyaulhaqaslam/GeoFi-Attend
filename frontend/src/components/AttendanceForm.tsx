@@ -132,11 +132,10 @@ const AttendanceForm: React.FC<AttendanceFormProps> = ({ offices, userId }) => {
         'Tidak bisa terhubung ke server (cek port forward/proxy)';
 
       const detail = [
-        data?.distance ? `Jarak: ${Math.round(data.distance)}m` : null,
-        data?.ip_address ? `IP: ${data.ip_address}` : null,
-        data?.geofence_status ? `Geo: ${data.geofence_status}` : null,
-        data?.wifi_status ? `WiFi/Jaringan: ${data.wifi_status}` : null,
+        data?.accuracy_m ? `Akurasi: ${Math.round(data.accuracy_m)}m` : null,
+        data?.office_radius_m ? `Radius Kantor: ${data.office_radius_m}m` : null,
       ].filter(Boolean).join(' | ');
+
 
       setMessage({ type: 'error', text: detail ? `${errorMessage} (${detail})` : errorMessage });
     } finally {
@@ -158,6 +157,12 @@ const AttendanceForm: React.FC<AttendanceFormProps> = ({ offices, userId }) => {
             {locationAccuracy !== null && (
               <p><strong>Akurasi:</strong> ±{Math.round(locationAccuracy)} meter</p>
             )}
+            {selectedOfficeData && (
+              <p>
+                <strong>Radius Absensi:</strong> {selectedOfficeData.radius_meters} meter
+              </p>
+            )}
+
             <button onClick={refreshLocation} className="refresh-location-btn" disabled={isLoading}>
               {isLoading ? 'Memproses...' : 'Refresh Lokasi'}
             </button>
@@ -218,28 +223,8 @@ const AttendanceForm: React.FC<AttendanceFormProps> = ({ offices, userId }) => {
           <p><strong>Jenis:</strong> {lastAttendance.type === 'checkin' ? 'Check-in' : 'Check-out'}</p>
           <p><strong>Waktu:</strong> {new Date(lastAttendance.timestamp).toLocaleString('id-ID')}</p>
           <p><strong>Jarak ke Kantor:</strong> {Math.round(lastAttendance.distance_to_office_m)} meter</p>
-          <p><strong>Geofence:</strong>{' '}
-            <span className={lastAttendance.geofence_status === 'PASS' ? 'status-pass' : 'status-fail'}>
-              {lastAttendance.geofence_status}
-            </span>
-          </p>
-          <p><strong>WiFi/Jaringan:</strong>{' '}
-            <span className={lastAttendance.wifi_status === 'PASS' ? 'status-pass' : 'status-fail'}>
-              {lastAttendance.wifi_status}
-            </span>
-          </p>
         </div>
       )}
-
-      <div className="security-notice">
-        <h4>⚠️ Aturan Validasi</h4>
-        <ul>
-          <li>Absensi hanya diterima jika <b>dalam radius kantor</b> (Geofence PASS)</li>
-          <li>Absensi hanya diterima jika <b>menggunakan jaringan kantor</b> (WiFi/Jaringan PASS)</li>
-          <li>Website tidak bisa membaca SSID/BSSID secara aman; validasi WiFi dilakukan via IP/CIDR whitelist</li>
-          <li>Jika akurasi GPS terlalu buruk, sistem menolak</li>
-        </ul>
-      </div>
     </div>
   );
 };

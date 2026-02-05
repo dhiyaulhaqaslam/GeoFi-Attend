@@ -71,12 +71,26 @@ function parseIntQuery(v: any): number | null {
    return Math.trunc(n);
 }
 
+function parseIntStrict(v: any): number | null {
+   const n = Number(v);
+   if (!Number.isFinite(n)) return null;
+   const i = Math.trunc(n);
+   if (String(v).trim() === "" || i !== n) return null;
+   return i;
+}
+
 // ambil IP real (x-forwarded-for / req.ip)
 function getClientIp(req: Request): string {
    const xf = req.headers["x-forwarded-for"] as string | undefined;
    if (xf) return normalizeIp(xf);
    return normalizeIp(req.ip);
 }
+
+// ===================================
+// CONFIG (SENGAJA SEDERHANA)
+// ===================================
+// MATIKAN dulu validasi jaringan kantor (fokus radius GPS)
+const ENFORCE_OFFICE_NETWORK = false;
 
 // =====================
 // PUBLIC: OFFICES
@@ -113,6 +127,22 @@ router.get(
    }
 );
 
+router.get("/demo-users", async (_req, res) => {
+   try {
+      const users = await db.all<{
+         id: number;
+         username: string;
+         name: string;
+         role: "admin" | "employee";
+      }>(`SELECT id, username, name, role FROM users ORDER BY id`);
+
+      return res.json({ success: true, data: users });
+   } catch (e) {
+      console.error("Error fetching demo users:", e);
+      return res.status(500).json({ error: "Internal server error" });
+   }
+});
+
 router.get(
    "/admin/records",
    authenticateUser,
@@ -138,7 +168,6 @@ router.get(
             params.push(userId);
          }
          if (date) {
-            // expect YYYY-MM-DD
             where.push("DATE(ar.timestamp) = ?");
             params.push(date);
          }
@@ -189,6 +218,7 @@ async function validateRequest(
    const office = await db.get<Office>("SELECT * FROM offices WHERE id = ?", [
       officeId,
    ]);
+
    if (!office) {
       return {
          ok: false as const,
@@ -197,55 +227,16 @@ async function validateRequest(
       };
    }
 
-   // geofence
-   const geo = checkGeofence(
-      lat,
-      lng,
-      office.latitude,
-      office.longitude,
-      office.radius_meters
-   );
-   if (geo.status === "FAIL") {
-      return {
-         ok: false as const,
-         status: 403,
-         body: {
-            error: "Anda berada di luar area kantor",
-            distance: geo.distance,
-            geofence_status: geo.status,
-         },
-      };
-   }
-
-   // network whitelist (WiFi kantor versi web)
-   const networks = await db.all<{ cidr: string }>(
-      "SELECT cidr FROM office_networks WHERE office_id = ?",
-      [officeId]
-   );
-   const cidrs = networks.map((n) => n.cidr);
-
-   const clientIP = getClientIp(req);
-
-   // jika whitelist kosong => FAIL
-   const networkPass = cidrs.length > 0 && isIPInOfficeNetwork(clientIP, cidrs);
-   if (!networkPass) {
-      return {
-         ok: false as const,
-         status: 403,
-         body: {
-            error: "Anda tidak menggunakan jaringan kantor (WiFi kantor)",
-            wifi_status: "FAIL",
-            ip_address: clientIP,
-         },
-      };
-   }
-
+   // GEOFENCE & NETWORK DIMATIKAN
    return {
       ok: true as const,
       office,
-      geo,
-      clientIP,
-      wifi_status: "PASS" as const,
+      geo: {
+         status: "PASS",
+         distance: 0,
+      },
+      clientIP: req.ip,
+      wifi_status: "NOT_CHECKED" as const,
       userAgent: req.get("User-Agent") || "unknown",
    };
 }
@@ -260,7 +251,7 @@ router.post("/checkin", authenticateUser, async (req, res) => {
 
       const lat = parseNumberStrict(req.body.latitude);
       const lng = parseNumberStrict(req.body.longitude);
-      const officeId = parseNumberStrict(req.body.officeId);
+      const officeId = parseIntStrict(req.body.officeId);
       const accuracy = parseNumberStrict(req.body.accuracy_m);
 
       if (lat === null || lng === null || officeId === null) {
@@ -273,10 +264,21 @@ router.post("/checkin", authenticateUser, async (req, res) => {
          return res.status(400).json({ error: "Invalid coordinates" });
       }
 
-      // optional: reject akurasi jelek
-      if (accuracy !== null && accuracy > 80) {
+      const office = await db.get<Office>(
+         "SELECT * FROM offices WHERE id = ?",
+         [officeId]
+      );
+      if (!office) return res.status(404).json({ error: "Office not found" });
+
+      // aturan sederhana: max akurasi = radius kantor dari DB
+      const maxAllowedAccuracy = office.radius_meters;
+
+      if (accuracy !== null && accuracy > maxAllowedAccuracy) {
          return res.status(400).json({
-            error: "Akurasi GPS terlalu rendah (>80m). Coba refresh lokasi.",
+            error: `Akurasi GPS terlalu rendah (>${maxAllowedAccuracy}m). Coba refresh lokasi.`,
+            accuracy_m: accuracy,
+            max_allowed_accuracy_m: maxAllowedAccuracy,
+            office_radius_m: office.radius_meters,
          });
       }
 
@@ -342,6 +344,8 @@ router.post("/checkin", authenticateUser, async (req, res) => {
             wifi_status: validated.wifi_status,
             ip_address: validated.clientIP,
             office_name: validated.office.name,
+            office_radius_m: validated.office.radius_meters,
+            accuracy_m: accuracy,
          },
       });
    } catch (error) {
@@ -360,7 +364,7 @@ router.post("/checkout", authenticateUser, async (req, res) => {
 
       const lat = parseNumberStrict(req.body.latitude);
       const lng = parseNumberStrict(req.body.longitude);
-      const officeId = parseNumberStrict(req.body.officeId);
+      const officeId = parseIntStrict(req.body.officeId);
       const accuracy = parseNumberStrict(req.body.accuracy_m);
 
       if (lat === null || lng === null || officeId === null) {
@@ -373,9 +377,22 @@ router.post("/checkout", authenticateUser, async (req, res) => {
          return res.status(400).json({ error: "Invalid coordinates" });
       }
 
-      if (accuracy !== null && accuracy > 80) {
+      // ambil office dulu untuk baca radius DB
+      const office = await db.get<Office>(
+         "SELECT * FROM offices WHERE id = ?",
+         [officeId]
+      );
+      if (!office) return res.status(404).json({ error: "Office not found" });
+
+      // aturan sederhana: max akurasi = radius kantor dari DB
+      const maxAllowedAccuracy = office.radius_meters;
+
+      if (accuracy !== null && accuracy > maxAllowedAccuracy) {
          return res.status(400).json({
-            error: "Akurasi GPS terlalu rendah (>80m). Coba refresh lokasi.",
+            error: `Akurasi GPS terlalu rendah (>${maxAllowedAccuracy}m). Coba refresh lokasi.`,
+            accuracy_m: accuracy,
+            max_allowed_accuracy_m: maxAllowedAccuracy,
+            office_radius_m: office.radius_meters,
          });
       }
 
@@ -441,6 +458,8 @@ router.post("/checkout", authenticateUser, async (req, res) => {
             wifi_status: validated.wifi_status,
             ip_address: validated.clientIP,
             office_name: validated.office.name,
+            office_radius_m: validated.office.radius_meters,
+            accuracy_m: accuracy,
          },
       });
    } catch (error) {
@@ -479,5 +498,31 @@ router.get("/records", authenticateUser, async (req, res) => {
       res.status(500).json({ error: "Internal server error" });
    }
 });
+
+router.patch(
+   "/admin/offices/:id/radius",
+   authenticateUser,
+   requireAdmin,
+   async (req, res) => {
+      const officeId = Number(req.params.id);
+      const radius = Number(req.body.radius_meters);
+
+      if (!officeId || !Number.isFinite(radius) || radius <= 0) {
+         return res
+            .status(400)
+            .json({ error: "Invalid officeId / radius_meters" });
+      }
+
+      await db.run(`UPDATE offices SET radius_meters = ? WHERE id = ?`, [
+         radius,
+         officeId,
+      ]);
+
+      const office = await db.get(`SELECT * FROM offices WHERE id = ?`, [
+         officeId,
+      ]);
+      return res.json({ success: true, data: office });
+   }
+);
 
 export default router;

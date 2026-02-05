@@ -1,4 +1,5 @@
-import React, { useEffect, useState } from 'react';
+// frontend/src/App.tsx
+import React, { useEffect, useMemo, useState } from 'react';
 import AttendanceForm from './components/AttendanceForm';
 import AttendanceHistory from './components/AttendanceHistory';
 import AdminDashboard from './components/AdminDashboard';
@@ -22,54 +23,75 @@ interface User {
     role: Role;
 }
 
-const MOCK_USERS: User[] = [
-    { id: 1, username: 'admin', name: 'Administrator', role: 'admin' },
-    { id: 2, username: 'pegawai1', name: 'Pegawai Satu', role: 'employee' },
-    { id: 3, username: 'pegawai2', name: 'Pegawai Dua', role: 'employee' },
-    { id: 4, username: 'pegawai3', name: 'Pegawai Tiga', role: 'employee' },
-];
-
 export default function App() {
     const [currentUser, setCurrentUser] = useState<User | null>(null);
     const [offices, setOffices] = useState<Office[]>([]);
     const [activeTab, setActiveTab] = useState<'attendance' | 'history' | 'admin'>('attendance');
     const [loading, setLoading] = useState(true);
 
+    const [users, setUsers] = useState<User[]>([]);
+    const [initError, setInitError] = useState<string | null>(null);
+
+    const loadUsers = async (): Promise<User[]> => {
+        const res = await fetch('/api/attendance/demo-users');
+        if (!res.ok) {
+            const txt = await res.text().catch(() => '');
+            throw new Error(`Failed load users: ${res.status} ${txt}`);
+        }
+        const json = await res.json();
+        return (json.data ?? []) as User[];
+    };
+
+    const loadOffices = async (): Promise<Office[]> => {
+        const res = await fetch('/api/attendance/offices');
+        if (!res.ok) {
+            const txt = await res.text().catch(() => '');
+            throw new Error(`Failed load offices: ${res.status} ${txt}`);
+        }
+        return (await res.json()) as Office[];
+    };
+
     useEffect(() => {
         const init = async () => {
-            const userId = localStorage.getItem('userId');
-            if (userId) {
-                const user = MOCK_USERS.find(u => u.id === parseInt(userId, 10));
-                if (user) setCurrentUser(user);
-            }
+            try {
+                setInitError(null);
 
-            await loadOffices();
-            setLoading(false);
+                // load users dulu
+                const loadedUsers = await loadUsers();
+                setUsers(loadedUsers);
+
+                // restore session (kalau ada)
+                const storedId = localStorage.getItem('userId');
+                if (storedId) {
+                    const uid = Number(storedId);
+                    const u = loadedUsers.find(x => x.id === uid);
+                    if (u) setCurrentUser(u);
+                    else localStorage.removeItem('userId');
+                }
+
+                // load offices
+                const loadedOffices = await loadOffices();
+                setOffices(loadedOffices);
+            } catch (e: any) {
+                console.error('Init error:', e);
+                setInitError(e?.message || 'Init failed');
+            } finally {
+                setLoading(false);
+            }
         };
 
         init();
     }, []);
 
-    const loadOffices = async () => {
-        try {
-            const res = await fetch('/api/attendance/offices');
-            if (!res.ok) {
-                console.error('Failed to load offices:', res.status);
-                return;
-            }
-            const data: Office[] = await res.json();
-            setOffices(data);
-        } catch (e) {
-            console.error('Error loading offices:', e);
-        }
-    };
-
     const handleLogin = (userId: number) => {
-        const user = MOCK_USERS.find(u => u.id === userId);
-        if (user) {
-            setCurrentUser(user);
-            localStorage.setItem('userId', String(userId));
+        const user = users.find(u => u.id === userId);
+        if (!user) {
+            alert(`User id=${userId} tidak ditemukan (cek /api/attendance/demo-users)`);
+            return;
         }
+        setCurrentUser(user);
+        localStorage.setItem('userId', String(userId));
+        setActiveTab('attendance');
     };
 
     const handleLogout = () => {
@@ -78,8 +100,32 @@ export default function App() {
         setActiveTab('attendance');
     };
 
+    // safety: user non-admin tidak boleh stay di tab admin
+    useEffect(() => {
+        if (currentUser?.role !== 'admin' && activeTab === 'admin') {
+            setActiveTab('attendance');
+        }
+    }, [currentUser, activeTab]);
+
     if (loading) return <div className="loading">Loading...</div>;
-    if (!currentUser) return <LoginForm onLogin={handleLogin} />;
+
+    if (initError) {
+        return (
+            <div className="loading" style={{ padding: 16 }}>
+                <h3>Gagal inisialisasi</h3>
+                <p>{initError}</p>
+                <p style={{ marginTop: 8 }}>
+                    Pastikan backend jalan, dan endpoint:
+                    <br />
+                    <code>/api/attendance/demo-users</code> dan <code>/api/attendance/offices</code> tersedia.
+                </p>
+            </div>
+        );
+    }
+
+    if (!currentUser) {
+        return <LoginForm users={users} onLogin={handleLogin} />;
+    }
 
     return (
         <div className="App">
@@ -114,27 +160,40 @@ export default function App() {
     );
 }
 
-function LoginForm({ onLogin }: { onLogin: (userId: number) => void }) {
-    const [selectedUser, setSelectedUser] = useState<number>(2);
+function LoginForm({ users, onLogin }: { users: User[]; onLogin: (userId: number) => void }) {
+    const firstId = useMemo(() => (users.length ? users[0].id : 1), [users]);
+    const [selectedUser, setSelectedUser] = useState<number>(firstId);
+
+    useEffect(() => {
+        setSelectedUser(firstId);
+    }, [firstId]);
 
     return (
         <div className="login-container">
             <div className="login-form">
                 <h2>Login Sistem Absensi</h2>
-                <form onSubmit={(e) => { e.preventDefault(); onLogin(selectedUser); }}>
-                    <div className="form-group">
-                        <label>Pilih User (Demo):</label>
-                        <select value={selectedUser} onChange={(e) => setSelectedUser(parseInt(e.target.value, 10))}>
-                            <option value={1}>Administrator</option>
-                            <option value={2}>Pegawai Satu</option>
-                            <option value={3}>Pegawai Dua</option>
-                            <option value={4}>Pegawai Tiga</option>
-                        </select>
-                    </div>
-                    <button type="submit" className="login-btn">Login</button>
-                </form>
-                <div className="demo-notice">
-                    <p><strong>Demo Mode:</strong> Auth masih demo (pakai header user-id).</p>
+
+                {users.length === 0 ? (
+                    <p>Tidak ada user. Jalankan seed, lalu pastikan endpoint demo-users mengembalikan data.</p>
+                ) : (
+                    <form onSubmit={(e) => { e.preventDefault(); onLogin(selectedUser); }}>
+                        <div className="form-group">
+                            <label>Pilih User (Demo):</label>
+                            <select value={selectedUser} onChange={(e) => setSelectedUser(Number(e.target.value))}>
+                                {users.map((u) => (
+                                    <option key={u.id} value={u.id}>
+                                        {u.name} ({u.role})
+                                    </option>
+                                ))}
+                            </select>
+                        </div>
+
+                        <button type="submit" className="login-btn">Login</button>
+                    </form>
+                )}
+
+                <div className="demo-notice" style={{ marginTop: 12 }}>
+                    <p><strong>Demo Mode:</strong> Auth masih demo (pakai header <code>user-id</code>).</p>
                 </div>
             </div>
         </div>

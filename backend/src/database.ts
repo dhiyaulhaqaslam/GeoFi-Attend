@@ -1,3 +1,4 @@
+// backend/src/database.ts
 import sqlite3 from "sqlite3";
 
 export interface User {
@@ -34,14 +35,12 @@ export interface AttendanceRecord {
    user_id: number;
    office_id: number;
    type: "checkin" | "checkout";
-   timestamp: string; // SQLite datetime string: "YYYY-MM-DD HH:MM:SS"
+   timestamp: string;
    latitude: number;
    longitude: number;
    distance_to_office_m: number;
    geofence_status: "PASS" | "FAIL";
-   wifi_ssid?: string;
-   wifi_bssid?: string;
-   wifi_status: "PASS" | "FAIL" | "NOT_CHECKED"; // di web: ini dipakai untuk "NETWORK PASS/FAIL"
+   wifi_status: "PASS" | "FAIL" | "NOT_CHECKED";
    ip_address?: string;
    user_agent: string;
    notes?: string;
@@ -66,72 +65,68 @@ class Database {
 
    private initTables(): void {
       const schemaSql = `
-      PRAGMA foreign_keys = ON;
+PRAGMA foreign_keys = ON;
 
-      CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE NOT NULL,
-        name TEXT NOT NULL,
-        email TEXT UNIQUE NOT NULL,
-        role TEXT DEFAULT 'employee',
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-      );
+CREATE TABLE IF NOT EXISTS users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  username TEXT UNIQUE NOT NULL,
+  name TEXT NOT NULL,
+  email TEXT UNIQUE NOT NULL,
+  role TEXT DEFAULT 'employee',
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
 
-      CREATE TABLE IF NOT EXISTS offices (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL,
-        latitude REAL NOT NULL,
-        longitude REAL NOT NULL,
-        radius_meters INTEGER DEFAULT 100,
-        address TEXT,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-      );
+CREATE TABLE IF NOT EXISTS offices (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  latitude REAL NOT NULL,
+  longitude REAL NOT NULL,
+  radius_meters INTEGER DEFAULT 100,
+  address TEXT,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
 
-      -- disiapkan untuk mobile app (SSID/BSSID). Website tidak bisa verifikasi SSID/BSSID secara aman.
-      CREATE TABLE IF NOT EXISTS office_wifi (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        office_id INTEGER NOT NULL,
-        ssid TEXT NOT NULL,
-        bssid TEXT,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (office_id) REFERENCES offices (id) ON DELETE CASCADE
-      );
+CREATE TABLE IF NOT EXISTS office_wifi (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  office_id INTEGER NOT NULL,
+  ssid TEXT NOT NULL,
+  bssid TEXT,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (office_id) REFERENCES offices (id) ON DELETE CASCADE
+);
 
-      -- INI yang dipakai untuk "wajib WiFi" versi web (IP/CIDR whitelist)
-      CREATE TABLE IF NOT EXISTS office_networks (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        office_id INTEGER NOT NULL,
-        cidr TEXT NOT NULL,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (office_id) REFERENCES offices (id) ON DELETE CASCADE
-      );
+CREATE TABLE IF NOT EXISTS office_networks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  office_id INTEGER NOT NULL,
+  cidr TEXT NOT NULL,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (office_id) REFERENCES offices (id) ON DELETE CASCADE
+);
 
-      CREATE TABLE IF NOT EXISTS attendance_records (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        office_id INTEGER NOT NULL,
-        type TEXT NOT NULL CHECK(type IN ('checkin', 'checkout')),
-        timestamp DATETIME NOT NULL,
-        latitude REAL NOT NULL,
-        longitude REAL NOT NULL,
-        distance_to_office_m REAL NOT NULL,
-        geofence_status TEXT NOT NULL CHECK(geofence_status IN ('PASS', 'FAIL')),
-        wifi_ssid TEXT,
-        wifi_bssid TEXT,
-        wifi_status TEXT DEFAULT 'NOT_CHECKED' CHECK(wifi_status IN ('PASS', 'FAIL', 'NOT_CHECKED')),
-        ip_address TEXT,
-        user_agent TEXT NOT NULL,
-        notes TEXT,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
-        FOREIGN KEY (office_id) REFERENCES offices (id) ON DELETE CASCADE
-      );
+CREATE TABLE IF NOT EXISTS attendance_records (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  office_id INTEGER NOT NULL,
+  type TEXT NOT NULL CHECK(type IN ('checkin','checkout')),
+  timestamp DATETIME NOT NULL,
+  latitude REAL NOT NULL,
+  longitude REAL NOT NULL,
+  distance_to_office_m REAL NOT NULL,
+  geofence_status TEXT NOT NULL CHECK(geofence_status IN ('PASS','FAIL')),
+  wifi_status TEXT DEFAULT 'NOT_CHECKED' CHECK(wifi_status IN ('PASS','FAIL','NOT_CHECKED')),
+  ip_address TEXT,
+  user_agent TEXT NOT NULL,
+  notes TEXT,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
+  FOREIGN KEY (office_id) REFERENCES offices (id) ON DELETE CASCADE
+);
 
-      CREATE INDEX IF NOT EXISTS idx_attendance_user_time ON attendance_records(user_id, timestamp);
-      CREATE INDEX IF NOT EXISTS idx_attendance_office_time ON attendance_records(office_id, timestamp);
-    `;
+CREATE INDEX IF NOT EXISTS idx_attendance_user_time ON attendance_records(user_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_attendance_office_time ON attendance_records(office_id, timestamp);
+`;
 
       this.db.exec(schemaSql, (err) => {
          if (err) {
@@ -139,30 +134,33 @@ class Database {
             return;
          }
 
-         // seed default data (aman, idempotent)
-         const seedSql = `
-        INSERT OR IGNORE INTO offices (id, name, latitude, longitude, radius_meters, address) VALUES
-          (1, 'Kantor Pusat', -6.2088, 106.8456, 100, 'Jl. Sudirman No. 1, Jakarta');
+         // 1) bersihkan duplikat office_networks dulu (kalau ada)
+         const cleanupDuplicates = `
+DELETE FROM office_networks
+WHERE rowid NOT IN (
+  SELECT MIN(rowid)
+  FROM office_networks
+  GROUP BY office_id, cidr
+);
+`;
 
-        -- DEV whitelist (localhost)
-        INSERT OR IGNORE INTO office_networks (office_id, cidr) VALUES
-          (1, '127.0.0.1/32');
-
-        -- CONTOH LAN kantor (ubah sesuai LAN WiFi kantor kamu)
-        INSERT OR IGNORE INTO office_networks (office_id, cidr) VALUES
-          (1, '192.168.1.0/24');
-
-        INSERT OR IGNORE INTO users (id, username, name, email, role) VALUES
-          (1, 'admin', 'Administrator', 'admin@company.com', 'admin');
-
-        INSERT OR IGNORE INTO users (id, username, name, email, role) VALUES
-          (2, 'pegawai1', 'Pegawai Satu', 'pegawai1@company.com', 'employee');
-      `;
-
-         this.db.exec(seedSql, (seedErr) => {
-            if (seedErr) {
-               console.error("Error seeding data:", seedErr.message);
+         this.db.exec(cleanupDuplicates, (dupErr) => {
+            if (dupErr) {
+               console.error("Error cleaning duplicates:", dupErr.message);
+               return;
             }
+
+            // 2) baru buat UNIQUE index (setelah bersih)
+            const uniqueIndexSql = `
+CREATE UNIQUE INDEX IF NOT EXISTS uq_office_networks_office_cidr
+ON office_networks(office_id, cidr);
+`;
+
+            this.db.exec(uniqueIndexSql, (idxErr) => {
+               if (idxErr) {
+                  console.error("Error creating unique index:", idxErr.message);
+               }
+            });
          });
       });
    }

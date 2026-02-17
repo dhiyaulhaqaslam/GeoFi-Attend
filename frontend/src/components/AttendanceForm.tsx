@@ -56,6 +56,10 @@ const AttendanceForm: React.FC<AttendanceFormProps> = ({ offices, userId }) => {
   const [camOn, setCamOn] = useState(false);
   const [camError, setCamError] = useState<string | null>(null);
 
+  // face enrollment status (null = loading, true/false = enrolled or not)
+  const [faceEnrolled, setFaceEnrolled] = useState<boolean | null>(null);
+  const [enrollLoading, setEnrollLoading] = useState(false);
+
   useEffect(() => {
     if (!selectedOffice && offices.length > 0) setSelectedOffice(offices[0].id);
   }, [offices, selectedOffice]);
@@ -137,9 +141,21 @@ const AttendanceForm: React.FC<AttendanceFormProps> = ({ offices, userId }) => {
     }
   };
 
+  const loadFaceStatus = async () => {
+    try {
+      const res = await axios.get("/api/attendance/face/status", {
+        headers: { "user-id": userId.toString() },
+      });
+      setFaceEnrolled(Boolean(res.data?.enrolled));
+    } catch {
+      setFaceEnrolled(false);
+    }
+  };
+
   useEffect(() => {
     refreshLocation();
     loadLastAttendance();
+    loadFaceStatus();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [userId]);
 
@@ -209,6 +225,44 @@ const AttendanceForm: React.FC<AttendanceFormProps> = ({ offices, userId }) => {
     return c.toDataURL("image/jpeg", 0.9);
   };
 
+  // ===== face enrollment =====
+  const handleEnrollFace = async () => {
+    if (!camOn) {
+      setMessage({ type: "error", text: "Aktifkan kamera terlebih dahulu, lalu klik Daftar Wajah lagi." });
+      return;
+    }
+    const faceImage = captureFaceImageBase64();
+    if (!faceImage) {
+      setMessage({ type: "error", text: "Gagal mengambil gambar. Pastikan wajah terlihat di kamera." });
+      return;
+    }
+    setEnrollLoading(true);
+    setMessage(null);
+    try {
+      await axios.post(
+        "/api/attendance/face/enroll",
+        { image_base64: faceImage },
+        { headers: { "user-id": userId.toString() } }
+      );
+      setMessage({ type: "success", text: "Wajah berhasil didaftarkan. Sekarang Anda bisa check-in/check-out." });
+      loadFaceStatus();
+    } catch (error: any) {
+      const raw = error?.response?.data?.error || error?.message || "Gagal mendaftarkan wajah.";
+      let errMsg = raw;
+      const r = String(raw).toLowerCase();
+      if (r.includes("fetch failed") || r.includes("tidak dapat dihubungi") || r.includes("network error") || r.includes("failed to fetch")) {
+        errMsg = "Layanan wajah tidak dapat dihubungi. Pastikan Face Service (Python) berjalan di port 8001. Lihat HOW_TO_RUN.md.";
+      } else if (r.includes("no face detected") || r.includes("wajah tidak terdeteksi")) {
+        errMsg = "Wajah tidak terdeteksi. Pastikan wajah Anda terlihat jelas di dalam frame kamera, lalu coba lagi.";
+      } else if (String(raw).toLowerCase().includes("invalid image") || String(raw).toLowerCase().includes("empty image")) {
+        errMsg = "Gambar tidak valid. Aktifkan kamera, pastikan wajah terlihat, lalu klik Daftar Wajah lagi.";
+      }
+      setMessage({ type: "error", text: errMsg });
+    } finally {
+      setEnrollLoading(false);
+    }
+  };
+
   // ===== submit attendance =====
   const handleAttendance = async (type: "checkin" | "checkout") => {
     if (!selectedOfficeData) {
@@ -257,7 +311,16 @@ const AttendanceForm: React.FC<AttendanceFormProps> = ({ offices, userId }) => {
       }
     } catch (error: any) {
       const data = error?.response?.data;
-      const errorMessage = data?.error || error?.message || "Tidak bisa terhubung ke server.";
+      const status = error?.response?.status;
+      let errorMessage = data?.error || error?.message || "Tidak bisa terhubung ke server.";
+
+      if (status === 503 || String(errorMessage).toLowerCase().includes("tidak dapat dihubungi")) {
+        setMessage({
+          type: "error",
+          text: "Layanan wajah tidak dapat dihubungi. Pastikan Face Service (Python) berjalan di port 8001. Lihat HOW_TO_RUN.md.",
+        });
+        return;
+      }
 
       if (String(errorMessage).toLowerCase().includes("di luar radius")) {
         const d = data?.distance_to_office_m;
@@ -271,6 +334,7 @@ const AttendanceForm: React.FC<AttendanceFormProps> = ({ offices, userId }) => {
 
       // face fail user-friendly
       if (String(errorMessage).toLowerCase().includes("wajah")) {
+        loadFaceStatus(); // refresh status so "Daftar Wajah" is visible if not enrolled
         const fd = data?.face_distance;
         const thr = data?.threshold;
         setMessage({
@@ -290,9 +354,23 @@ const AttendanceForm: React.FC<AttendanceFormProps> = ({ offices, userId }) => {
     <div className="attendance-form">
       <h2>Absensi Harian</h2>
 
-      {/* ===== FACE CAMERA ===== */}
+      {/* ===== FACE CAMERA & ENROLL ===== */}
       <div style={{ marginTop: 12, padding: 12, border: "1px solid #e5e7eb", borderRadius: 10 }}>
         <div style={{ fontWeight: 700, marginBottom: 8 }}>Verifikasi Wajah</div>
+
+        {faceEnrolled === false && (
+          <div
+            className="message error"
+            style={{ marginBottom: 10, background: "#fef2f2", border: "1px solid #fecaca" }}
+          >
+            Wajah belum didaftarkan. Silakan aktifkan kamera lalu klik <strong>Daftar Wajah</strong> di bawah agar bisa absen.
+          </div>
+        )}
+        {faceEnrolled === true && (
+          <div style={{ marginBottom: 8, fontSize: 14, color: "#059669", fontWeight: 600 }}>
+            ✓ Wajah sudah didaftarkan
+          </div>
+        )}
 
         {!camOn ? (
           <button type="button" onClick={startCamera} className="refresh-location-btn">
@@ -301,6 +379,18 @@ const AttendanceForm: React.FC<AttendanceFormProps> = ({ offices, userId }) => {
         ) : (
           <button type="button" onClick={stopCamera} className="refresh-location-btn">
             Matikan Kamera
+          </button>
+        )}
+
+        {camOn && (
+          <button
+            type="button"
+            onClick={handleEnrollFace}
+            disabled={enrollLoading}
+            className="refresh-location-btn"
+            style={{ marginLeft: 8, background: "#0891b2", color: "white", border: "none" }}
+          >
+            {enrollLoading ? "Mendaftarkan..." : "Daftar Wajah"}
           </button>
         )}
 
@@ -321,7 +411,7 @@ const AttendanceForm: React.FC<AttendanceFormProps> = ({ offices, userId }) => {
         </div>
 
         <div style={{ marginTop: 8, fontSize: 13, opacity: 0.85 }}>
-          Pastikan wajah terlihat jelas sebelum klik Check-In/Out.
+          {faceEnrolled ? "Pastikan wajah terlihat jelas sebelum klik Check-In/Out." : "Daftar wajah sekali, lalu gunakan untuk check-in/check-out."}
         </div>
       </div>
 

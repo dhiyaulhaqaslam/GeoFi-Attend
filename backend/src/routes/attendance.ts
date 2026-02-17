@@ -11,20 +11,39 @@ const FACE_SERVICE_URL =
    process.env.FACE_SERVICE_URL || "http://127.0.0.1:8001";
 const FACE_THRESHOLD = Number(process.env.FACE_THRESHOLD ?? 0.45);
 
+function parseFaceServiceError(json: any, txt: string, status: number): string {
+   if (json?.error && typeof json.error === "string") return json.error;
+   if (json?.detail !== undefined) {
+      if (typeof json.detail === "string") return json.detail;
+      if (Array.isArray(json.detail) && json.detail.length > 0) {
+         const first = json.detail[0];
+         return first?.msg ?? first?.message ?? String(first);
+      }
+   }
+   if (txt && txt.length < 200) return txt;
+   return `HTTP ${status}`;
+}
+
 async function postJson(url: string, body: any) {
-   const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-   });
-   const txt = await res.text();
+   let httpRes: Awaited<ReturnType<typeof fetch>>;
+   let txt: string;
+   try {
+      httpRes = await fetch(url, {
+         method: "POST",
+         headers: { "Content-Type": "application/json" },
+         body: JSON.stringify(body),
+      });
+      txt = await httpRes.text();
+   } catch (e: any) {
+      const msg = e?.message ?? "fetch failed";
+      throw new Error(msg);
+   }
    let json: any = null;
    try {
       json = txt ? JSON.parse(txt) : null;
    } catch {}
-   if (!res.ok) {
-      const msg = json?.detail || json?.error || txt || `HTTP ${res.status}`;
-      throw new Error(msg);
+   if (!httpRes.ok) {
+      throw new Error(parseFaceServiceError(json, txt, httpRes.status));
    }
    return json;
 }
@@ -33,7 +52,17 @@ function bufferToB64(buf: Buffer) {
    return buf.toString("base64");
 }
 
+function normalizeImageBase64(raw: string): string {
+   const s = raw.trim();
+   if (s.startsWith("data:")) {
+      const comma = s.indexOf(",");
+      return comma !== -1 ? s.slice(comma + 1) : s;
+   }
+   return s;
+}
+
 async function verifyFaceOrThrow(userId: number, imageBase64: string) {
+   const img = normalizeImageBase64(imageBase64);
    const templates = await db.all<{ embedding: Buffer; model: string }>(
       `SELECT embedding, model FROM user_face_templates WHERE user_id = ? ORDER BY id DESC LIMIT 20`,
       [userId]
@@ -46,7 +75,7 @@ async function verifyFaceOrThrow(userId: number, imageBase64: string) {
    const templatesB64 = templates.map((t) => bufferToB64(t.embedding));
 
    const vr = await postJson(`${FACE_SERVICE_URL}/verify`, {
-      image_base64: imageBase64,
+      image_base64: img,
       templates_b64: templatesB64,
       threshold: FACE_THRESHOLD,
    });
@@ -387,9 +416,14 @@ router.post("/checkin", authenticateUser, async (req, res) => {
 
          faceStatus = "PASS";
       } catch (e: any) {
-         return res
-            .status(400)
-            .json({ error: e?.message || "Face verify failed" });
+         const msg = e?.message || "Face verify failed";
+         const isNetworkError = /fetch failed|ECONNREFUSED|ENOTFOUND|ETIMEDOUT|network/i.test(msg);
+         if (isNetworkError) {
+            return res.status(503).json({
+               error: "Layanan verifikasi wajah tidak dapat dihubungi. Pastikan Face Service (Python) berjalan di port 8001.",
+            });
+         }
+         return res.status(400).json({ error: msg });
       }
 
       // Cegah checkin dobel hari yang sama (tanpa checkout)
@@ -528,9 +562,14 @@ router.post("/checkout", authenticateUser, async (req, res) => {
 
          faceStatus = "PASS";
       } catch (e: any) {
-         return res
-            .status(400)
-            .json({ error: e?.message || "Face verify failed" });
+         const msg = e?.message || "Face verify failed";
+         const isNetworkError = /fetch failed|ECONNREFUSED|ENOTFOUND|ETIMEDOUT|network/i.test(msg);
+         if (isNetworkError) {
+            return res.status(503).json({
+               error: "Layanan verifikasi wajah tidak dapat dihubungi. Pastikan Face Service (Python) berjalan di port 8001.",
+            });
+         }
+         return res.status(400).json({ error: msg });
       }
 
       // Harus ada checkin aktif hari ini
@@ -601,14 +640,29 @@ router.post("/checkout", authenticateUser, async (req, res) => {
    }
 });
 
+router.get("/face/status", authenticateUser, async (req, res) => {
+   try {
+      const user = (req as any).user as AuthUser;
+      const row = await db.get<{ count: number }>(
+         `SELECT COUNT(*) as count FROM user_face_templates WHERE user_id = ?`,
+         [user.id]
+      );
+      const count = row?.count ?? 0;
+      return res.json({ enrolled: count > 0, count });
+   } catch (e) {
+      return res.status(500).json({ error: "Internal server error" });
+   }
+});
+
 router.post("/face/enroll", authenticateUser, async (req, res) => {
    try {
       const user = (req as any).user as AuthUser;
       const userId = user.id;
 
-      const imageBase64 = String(req.body?.image_base64 ?? "").trim();
-      if (!imageBase64)
+      const rawImage = String(req.body?.image_base64 ?? "").trim();
+      if (!rawImage)
          return res.status(400).json({ error: "image_base64 is required" });
+      const imageBase64 = normalizeImageBase64(rawImage);
 
       // call python embed
       const r = await postJson(`${FACE_SERVICE_URL}/embed`, {
@@ -633,7 +687,16 @@ router.post("/face/enroll", authenticateUser, async (req, res) => {
          data: { id: ins.lastID, user_id: userId, model },
       });
    } catch (e: any) {
-      return res.status(400).json({ error: e?.message || "Enroll failed" });
+      const msg = e?.message || "Enroll failed";
+      const isNetworkError =
+         /fetch failed|ECONNREFUSED|ENOTFOUND|ETIMEDOUT|network/i.test(msg);
+      if (isNetworkError) {
+         return res.status(503).json({
+            error:
+               "Layanan verifikasi wajah tidak dapat dihubungi. Pastikan Face Service (Python) berjalan: cd face_service && uvicorn app:app --host 127.0.0.1 --port 8001",
+         });
+      }
+      return res.status(400).json({ error: msg });
    }
 });
 

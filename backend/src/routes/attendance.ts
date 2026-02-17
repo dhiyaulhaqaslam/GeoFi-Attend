@@ -7,6 +7,58 @@ import {
    normalizeIp,
 } from "../utils";
 
+const FACE_SERVICE_URL =
+   process.env.FACE_SERVICE_URL || "http://127.0.0.1:8001";
+const FACE_THRESHOLD = Number(process.env.FACE_THRESHOLD ?? 0.45);
+
+async function postJson(url: string, body: any) {
+   const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+   });
+   const txt = await res.text();
+   let json: any = null;
+   try {
+      json = txt ? JSON.parse(txt) : null;
+   } catch {}
+   if (!res.ok) {
+      const msg = json?.detail || json?.error || txt || `HTTP ${res.status}`;
+      throw new Error(msg);
+   }
+   return json;
+}
+
+function bufferToB64(buf: Buffer) {
+   return buf.toString("base64");
+}
+
+async function verifyFaceOrThrow(userId: number, imageBase64: string) {
+   const templates = await db.all<{ embedding: Buffer; model: string }>(
+      `SELECT embedding, model FROM user_face_templates WHERE user_id = ? ORDER BY id DESC LIMIT 20`,
+      [userId]
+   );
+
+   if (!templates.length) {
+      throw new Error("Wajah belum didaftarkan. Silakan enroll dulu.");
+   }
+
+   const templatesB64 = templates.map((t) => bufferToB64(t.embedding));
+
+   const vr = await postJson(`${FACE_SERVICE_URL}/verify`, {
+      image_base64: imageBase64,
+      templates_b64: templatesB64,
+      threshold: FACE_THRESHOLD,
+   });
+
+   return {
+      match: Boolean(vr.match),
+      best_distance: Number(vr.best_distance),
+      model: String(vr.model || templates[0].model || "unknown"),
+      threshold: Number(vr.threshold ?? FACE_THRESHOLD),
+   };
+}
+
 const router = express.Router();
 
 type AuthUser = {
@@ -278,6 +330,12 @@ router.post("/checkin", authenticateUser, async (req, res) => {
       const lat = parseNumberStrict(req.body.latitude);
       const lng = parseNumberStrict(req.body.longitude);
       const officeId = parseIntStrict(req.body.officeId);
+      const faceImage = String(req.body?.face_image_base64 ?? "").trim();
+      if (!faceImage) {
+         return res
+            .status(400)
+            .json({ error: "face_image_base64 is required" });
+      }
 
       // accuracy hanya catatan, tidak memblok
       const accuracy = parseNumberStrict(req.body.accuracy_m);
@@ -310,6 +368,30 @@ router.post("/checkin", authenticateUser, async (req, res) => {
          });
       }
 
+      let faceStatus: "PASS" | "FAIL" = "FAIL";
+      let faceDistance: number | null = null;
+      let faceModel: string | null = null;
+
+      try {
+         const fv = await verifyFaceOrThrow(userId, faceImage);
+         faceDistance = fv.best_distance;
+         faceModel = fv.model;
+
+         if (!fv.match) {
+            return res.status(403).json({
+               error: "Wajah tidak dikenali / verifikasi gagal",
+               face_distance: faceDistance,
+               threshold: fv.threshold,
+            });
+         }
+
+         faceStatus = "PASS";
+      } catch (e: any) {
+         return res
+            .status(400)
+            .json({ error: e?.message || "Face verify failed" });
+      }
+
       // Cegah checkin dobel hari yang sama (tanpa checkout)
       const today = getCurrentDate();
       const existingCheckin = await db.get<AttendanceRecord>(
@@ -339,8 +421,10 @@ router.post("/checkin", authenticateUser, async (req, res) => {
 
       const r = await db.run(
          `INSERT INTO attendance_records
-       (user_id, office_id, type, timestamp, latitude, longitude, distance_to_office_m, geofence_status, wifi_status, ip_address, user_agent, notes)
-       VALUES (?, ?, 'checkin', ?, ?, ?, ?, ?, 'NOT_CHECKED', ?, ?, ?)`,
+   (user_id, office_id, type, timestamp, latitude, longitude, distance_to_office_m, geofence_status, wifi_status, ip_address, user_agent, notes,
+    face_status, face_distance, face_model)
+   VALUES (?, ?, 'checkin', ?, ?, ?, ?, ?, 'NOT_CHECKED', ?, ?, ?,
+           ?, ?, ?)`,
          [
             userId,
             officeId,
@@ -352,6 +436,9 @@ router.post("/checkin", authenticateUser, async (req, res) => {
             ip,
             ua,
             accuracy !== null ? `accuracy_m=${accuracy}` : null,
+            faceStatus,
+            faceDistance,
+            faceModel,
          ]
       );
 
@@ -384,6 +471,12 @@ router.post("/checkout", authenticateUser, async (req, res) => {
       const lat = parseNumberStrict(req.body.latitude);
       const lng = parseNumberStrict(req.body.longitude);
       const officeId = parseIntStrict(req.body.officeId);
+      const faceImage = String(req.body?.face_image_base64 ?? "").trim();
+      if (!faceImage) {
+         return res
+            .status(400)
+            .json({ error: "face_image_base64 is required" });
+      }
 
       // accuracy hanya catatan, tidak memblok
       const accuracy = parseNumberStrict(req.body.accuracy_m);
@@ -416,6 +509,30 @@ router.post("/checkout", authenticateUser, async (req, res) => {
          });
       }
 
+      let faceStatus: "PASS" | "FAIL" = "FAIL";
+      let faceDistance: number | null = null;
+      let faceModel: string | null = null;
+
+      try {
+         const fv = await verifyFaceOrThrow(userId, faceImage);
+         faceDistance = fv.best_distance;
+         faceModel = fv.model;
+
+         if (!fv.match) {
+            return res.status(403).json({
+               error: "Wajah tidak dikenali / verifikasi gagal",
+               face_distance: faceDistance,
+               threshold: fv.threshold,
+            });
+         }
+
+         faceStatus = "PASS";
+      } catch (e: any) {
+         return res
+            .status(400)
+            .json({ error: e?.message || "Face verify failed" });
+      }
+
       // Harus ada checkin aktif hari ini
       const today = getCurrentDate();
       const activeCheckin = await db.get<AttendanceRecord>(
@@ -445,8 +562,10 @@ router.post("/checkout", authenticateUser, async (req, res) => {
 
       const r = await db.run(
          `INSERT INTO attendance_records
-       (user_id, office_id, type, timestamp, latitude, longitude, distance_to_office_m, geofence_status, wifi_status, ip_address, user_agent, notes)
-       VALUES (?, ?, 'checkout', ?, ?, ?, ?, ?, 'NOT_CHECKED', ?, ?, ?)`,
+   (user_id, office_id, type, timestamp, latitude, longitude, distance_to_office_m, geofence_status, wifi_status, ip_address, user_agent, notes,
+    face_status, face_distance, face_model)
+   VALUES (?, ?, 'checkout', ?, ?, ?, ?, ?, 'NOT_CHECKED', ?, ?, ?,
+           ?, ?, ?)`,
          [
             userId,
             officeId,
@@ -458,6 +577,9 @@ router.post("/checkout", authenticateUser, async (req, res) => {
             ip,
             ua,
             accuracy !== null ? `accuracy_m=${accuracy}` : null,
+            faceStatus,
+            faceDistance,
+            faceModel,
          ]
       );
 
@@ -476,6 +598,42 @@ router.post("/checkout", authenticateUser, async (req, res) => {
    } catch (e) {
       console.error("Error during check-out:", e);
       return res.status(500).json({ error: "Internal server error" });
+   }
+});
+
+router.post("/face/enroll", authenticateUser, async (req, res) => {
+   try {
+      const user = (req as any).user as AuthUser;
+      const userId = user.id;
+
+      const imageBase64 = String(req.body?.image_base64 ?? "").trim();
+      if (!imageBase64)
+         return res.status(400).json({ error: "image_base64 is required" });
+
+      // call python embed
+      const r = await postJson(`${FACE_SERVICE_URL}/embed`, {
+         image_base64: imageBase64,
+      });
+      const model = String(r.model || "unknown");
+      const embeddingB64 = String(r.embedding_b64 || "");
+      if (!embeddingB64)
+         return res.status(400).json({ error: "Failed to get embedding" });
+
+      const embeddingBuf = Buffer.from(embeddingB64, "base64");
+
+      // Simpan 1 template per enroll (boleh multiple kali untuk variasi)
+      const ins = await db.run(
+         `INSERT INTO user_face_templates (user_id, embedding, model) VALUES (?, ?, ?)`,
+         [userId, embeddingBuf, model]
+      );
+
+      return res.json({
+         success: true,
+         message: "Face enrolled",
+         data: { id: ins.lastID, user_id: userId, model },
+      });
+   } catch (e: any) {
+      return res.status(400).json({ error: e?.message || "Enroll failed" });
    }
 });
 

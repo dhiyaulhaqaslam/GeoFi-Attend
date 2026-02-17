@@ -45,6 +45,19 @@ export interface AttendanceRecord {
    user_agent: string;
    notes?: string;
    created_at: string;
+
+   // kolom baru untuk face (opsional di query)
+   face_status?: "PASS" | "FAIL" | "NOT_CHECKED";
+   face_distance?: number | null;
+   face_model?: string | null;
+}
+
+export interface UserFaceTemplate {
+   id: number;
+   user_id: number;
+   embedding: Buffer; // BLOB bytes
+   model: string;
+   created_at: string;
 }
 
 type RunResult = { lastID: number; changes: number };
@@ -56,14 +69,55 @@ class Database {
       this.db = new sqlite3.Database("./attendance.db", (err) => {
          if (err) {
             console.error("Error opening database:", err.message);
-         } else {
-            console.log("Connected to SQLite database.");
-            this.initTables();
+            return;
          }
+         console.log("Connected to SQLite database.");
+         // init async berurutan (tidak race). tidak perlu await di constructor.
+         void this.initTables();
       });
    }
 
-   private initTables(): void {
+   // --- Helpers untuk async/await ---
+   private exec(sql: string): Promise<void> {
+      return new Promise((resolve, reject) => {
+         this.db.exec(sql, (err) => (err ? reject(err) : resolve()));
+      });
+   }
+
+   private tableInfo(table: string): Promise<Array<{ name: string }>> {
+      return new Promise((resolve, reject) => {
+         this.db.all(`PRAGMA table_info(${table});`, [], (err, rows: any[]) => {
+            if (err) return reject(err);
+            resolve((rows ?? []).map((r) => ({ name: String(r.name) })));
+         });
+      });
+   }
+
+   private async ensureColumn(
+      table: string,
+      column: string,
+      ddl: string
+   ): Promise<void> {
+      try {
+         const cols = await this.tableInfo(table);
+         const exists = cols.some((c) => c.name === column);
+         if (exists) return;
+
+         await new Promise<void>((resolve, reject) => {
+            this.db.run(ddl, (err) => (err ? reject(err) : resolve()));
+         });
+         console.log(`[DB] Added column ${table}.${column}`);
+      } catch (e: any) {
+         // Jangan bikin startup mati — tapi log jelas
+         console.error(
+            `[DB] ensureColumn failed for ${table}.${column}:`,
+            e?.message || e
+         );
+      }
+   }
+
+   // --- Init schema: deterministic & restart-safe ---
+   private async initTables(): Promise<void> {
       const schemaSql = `
 PRAGMA foreign_keys = ON;
 
@@ -124,18 +178,24 @@ CREATE TABLE IF NOT EXISTS attendance_records (
   FOREIGN KEY (office_id) REFERENCES offices (id) ON DELETE CASCADE
 );
 
+-- Face templates (embedding per user)
+CREATE TABLE IF NOT EXISTS user_face_templates (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  embedding BLOB NOT NULL,
+  model TEXT NOT NULL,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_face_user ON user_face_templates(user_id);
+
+-- indeks attendance
 CREATE INDEX IF NOT EXISTS idx_attendance_user_time ON attendance_records(user_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_attendance_office_time ON attendance_records(office_id, timestamp);
 `;
 
-      this.db.exec(schemaSql, (err) => {
-         if (err) {
-            console.error("Error initializing schema:", err.message);
-            return;
-         }
-
-         // 1) bersihkan duplikat office_networks dulu (kalau ada)
-         const cleanupDuplicates = `
+      const cleanupDuplicates = `
 DELETE FROM office_networks
 WHERE rowid NOT IN (
   SELECT MIN(rowid)
@@ -144,27 +204,43 @@ WHERE rowid NOT IN (
 );
 `;
 
-         this.db.exec(cleanupDuplicates, (dupErr) => {
-            if (dupErr) {
-               console.error("Error cleaning duplicates:", dupErr.message);
-               return;
-            }
-
-            // 2) baru buat UNIQUE index (setelah bersih)
-            const uniqueIndexSql = `
+      const uniqueIndexSql = `
 CREATE UNIQUE INDEX IF NOT EXISTS uq_office_networks_office_cidr
 ON office_networks(office_id, cidr);
 `;
 
-            this.db.exec(uniqueIndexSql, (idxErr) => {
-               if (idxErr) {
-                  console.error("Error creating unique index:", idxErr.message);
-               }
-            });
-         });
-      });
+      try {
+         // 1) base schema
+         await this.exec(schemaSql);
+
+         // 2) kolom baru untuk attendance_records (restart-safe)
+         await this.ensureColumn(
+            "attendance_records",
+            "face_status",
+            "ALTER TABLE attendance_records ADD COLUMN face_status TEXT DEFAULT 'NOT_CHECKED'"
+         );
+         await this.ensureColumn(
+            "attendance_records",
+            "face_distance",
+            "ALTER TABLE attendance_records ADD COLUMN face_distance REAL"
+         );
+         await this.ensureColumn(
+            "attendance_records",
+            "face_model",
+            "ALTER TABLE attendance_records ADD COLUMN face_model TEXT"
+         );
+
+         // 3) cleanup + unique index
+         await this.exec(cleanupDuplicates);
+         await this.exec(uniqueIndexSql);
+
+         console.log("[DB] Schema init OK");
+      } catch (e: any) {
+         console.error("[DB] Error initializing schema:", e?.message || e);
+      }
    }
 
+   // --- Public query methods ---
    run(query: string, params: any[] = []): Promise<RunResult> {
       return new Promise((resolve, reject) => {
          this.db.run(query, params, function (this: sqlite3.RunResult, err) {

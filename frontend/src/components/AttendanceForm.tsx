@@ -50,6 +50,12 @@ const AttendanceForm: React.FC<AttendanceFormProps> = ({ offices, userId }) => {
 
   const [showOfficePoint, setShowOfficePoint] = useState(false);
 
+  // camera
+  const videoRef = React.useRef<HTMLVideoElement | null>(null);
+  const canvasRef = React.useRef<HTMLCanvasElement | null>(null);
+  const [camOn, setCamOn] = useState(false);
+  const [camError, setCamError] = useState<string | null>(null);
+
   useEffect(() => {
     if (!selectedOffice && offices.length > 0) setSelectedOffice(offices[0].id);
   }, [offices, selectedOffice]);
@@ -59,7 +65,7 @@ const AttendanceForm: React.FC<AttendanceFormProps> = ({ offices, userId }) => {
     [offices, selectedOffice]
   );
 
-  // Ambil lokasi: lakukan beberapa sampel, ambil yang terbaik (akurasi terkecil)
+  // ===== location sampling =====
   const getBestLocation = (samples = 5): Promise<BestLoc> => {
     return new Promise((resolve, reject) => {
       if (!navigator.geolocation) return reject(new Error("Geolocation tidak didukung"));
@@ -84,15 +90,10 @@ const AttendanceForm: React.FC<AttendanceFormProps> = ({ offices, userId }) => {
               if (!best) return reject(new Error("Tidak bisa ambil lokasi"));
               return resolve(best);
             }
-
             setTimeout(tryOnce, 700);
           },
           (err) => reject(err),
-          {
-            enableHighAccuracy: true,
-            timeout: 20000,
-            maximumAge: 0,
-          }
+          { enableHighAccuracy: true, timeout: 20000, maximumAge: 0 }
         );
       };
 
@@ -114,8 +115,6 @@ const AttendanceForm: React.FC<AttendanceFormProps> = ({ offices, userId }) => {
     try {
       const best = await getBestLocation(7);
       setLoc(best);
-      // Tidak ada lagi “lokasi belum stabil” sebagai pengunci.
-      // Kalau mau info akurasi, cukup tampilkan di UI (opsional).
     } catch (e: any) {
       setMessage({ type: "error", text: humanGeoError(e) });
     } finally {
@@ -154,9 +153,63 @@ const AttendanceForm: React.FC<AttendanceFormProps> = ({ offices, userId }) => {
     return distanceToOffice <= (selectedOfficeData.radius_meters ?? 20);
   }, [distanceToOffice, selectedOfficeData]);
 
-  // RULE FINAL: hanya radius.
   const canAttemptAttendance = Boolean(loc && selectedOfficeData && withinRadius);
 
+  // ===== camera functions =====
+  const startCamera = async () => {
+    setCamError(null);
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } },
+        audio: false,
+      });
+
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        await videoRef.current.play();
+      }
+      setCamOn(true);
+    } catch (e: any) {
+      setCamError(e?.message || "Tidak bisa akses kamera");
+      setCamOn(false);
+    }
+  };
+
+  const stopCamera = () => {
+    const v = videoRef.current;
+    const stream = v?.srcObject as MediaStream | null;
+    if (stream) stream.getTracks().forEach((t) => t.stop());
+    if (v) v.srcObject = null;
+    setCamOn(false);
+  };
+
+  useEffect(() => {
+    return () => stopCamera();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const captureFaceImageBase64 = (): string | null => {
+    const v = videoRef.current;
+    const c = canvasRef.current;
+    if (!v || !c) return null;
+    if (v.videoWidth === 0 || v.videoHeight === 0) return null;
+
+    // crop center square
+    const size = Math.min(v.videoWidth, v.videoHeight);
+    const sx = (v.videoWidth - size) / 2;
+    const sy = (v.videoHeight - size) / 2;
+
+    c.width = 480;
+    c.height = 480;
+
+    const ctx = c.getContext("2d");
+    if (!ctx) return null;
+    ctx.drawImage(v, sx, sy, size, size, 0, 0, c.width, c.height);
+
+    return c.toDataURL("image/jpeg", 0.9);
+  };
+
+  // ===== submit attendance =====
   const handleAttendance = async (type: "checkin" | "checkout") => {
     if (!selectedOfficeData) {
       setMessage({ type: "error", text: "Pilih kantor terlebih dahulu." });
@@ -170,13 +223,27 @@ const AttendanceForm: React.FC<AttendanceFormProps> = ({ offices, userId }) => {
       const best = await getBestLocation(7);
       setLoc(best);
 
+      if (!camOn) {
+        setMessage({ type: "error", text: "Kamera belum aktif. Aktifkan kamera untuk verifikasi wajah." });
+        return;
+      }
+
+      const faceImage = captureFaceImageBase64();
+      if (!faceImage) {
+        setMessage({ type: "error", text: "Gagal mengambil gambar wajah. Pastikan kamera menampilkan video." });
+        return;
+      }
+
       const response = await axios.post(
         `/api/attendance/${type}`,
         {
           latitude: best.lat,
           longitude: best.lng,
-          accuracy_m: best.accuracy, // tetap kirim untuk catatan, backend tidak memblok
+          accuracy_m: best.accuracy,
           officeId: selectedOfficeData.id,
+
+          // ✅ INI YANG KAMU LUPA:
+          face_image_base64: faceImage,
         },
         { headers: { "user-id": userId.toString() } }
       );
@@ -192,13 +259,23 @@ const AttendanceForm: React.FC<AttendanceFormProps> = ({ offices, userId }) => {
       const data = error?.response?.data;
       const errorMessage = data?.error || error?.message || "Tidak bisa terhubung ke server.";
 
-      // User-friendly: kalau gagal radius, jelaskan jarak & batasnya
       if (String(errorMessage).toLowerCase().includes("di luar radius")) {
         const d = data?.distance_to_office_m;
         const r = data?.office_radius_m;
         setMessage({
           type: "error",
           text: `Anda belum berada di area kantor. Jarak Anda ${d ? formatMeters(d) : "-"} (maks ${r ?? "-"} m).`,
+        });
+        return;
+      }
+
+      // face fail user-friendly
+      if (String(errorMessage).toLowerCase().includes("wajah")) {
+        const fd = data?.face_distance;
+        const thr = data?.threshold;
+        setMessage({
+          type: "error",
+          text: `${errorMessage}${fd != null ? ` (distance=${fd})` : ""}${thr != null ? ` threshold=${thr}` : ""}`,
         });
         return;
       }
@@ -212,6 +289,41 @@ const AttendanceForm: React.FC<AttendanceFormProps> = ({ offices, userId }) => {
   return (
     <div className="attendance-form">
       <h2>Absensi Harian</h2>
+
+      {/* ===== FACE CAMERA ===== */}
+      <div style={{ marginTop: 12, padding: 12, border: "1px solid #e5e7eb", borderRadius: 10 }}>
+        <div style={{ fontWeight: 700, marginBottom: 8 }}>Verifikasi Wajah</div>
+
+        {!camOn ? (
+          <button type="button" onClick={startCamera} className="refresh-location-btn">
+            Aktifkan Kamera
+          </button>
+        ) : (
+          <button type="button" onClick={stopCamera} className="refresh-location-btn">
+            Matikan Kamera
+          </button>
+        )}
+
+        {camError && (
+          <div className="message error" style={{ marginTop: 8 }}>
+            {camError}
+          </div>
+        )}
+
+        <div style={{ marginTop: 10 }}>
+          <video
+            ref={videoRef}
+            playsInline
+            muted
+            style={{ width: 320, height: 240, background: "#111", borderRadius: 8 }}
+          />
+          <canvas ref={canvasRef} style={{ display: "none" }} />
+        </div>
+
+        <div style={{ marginTop: 8, fontSize: 13, opacity: 0.85 }}>
+          Pastikan wajah terlihat jelas sebelum klik Check-In/Out.
+        </div>
+      </div>
 
       {/* ===== STATUS UTAMA ===== */}
       <div
@@ -232,15 +344,13 @@ const AttendanceForm: React.FC<AttendanceFormProps> = ({ offices, userId }) => {
             <>
               {distanceToOffice !== null ? (
                 <>
-                  Jarak Anda ke kantor: <strong>{formatMeters(distanceToOffice)}</strong>.
-                  {" "}
+                  Jarak Anda ke kantor: <strong>{formatMeters(distanceToOffice)}</strong>.{" "}
                   Batas absen: <strong>≤ {selectedOfficeData.radius_meters} m</strong>.
                 </>
               ) : (
                 <>Tekan Refresh Lokasi untuk cek jarak Anda ke kantor.</>
               )}
 
-              {/* info opsional (tidak memblok) */}
               {loc && (
                 <div style={{ marginTop: 6, fontSize: 13, opacity: 0.85 }}>
                   (Info GPS: perkiraan akurasi {Math.round(loc.accuracy)} m)
@@ -318,6 +428,7 @@ const AttendanceForm: React.FC<AttendanceFormProps> = ({ offices, userId }) => {
             )}
           </div>
         )}
+
         {selectedOfficeData && (
           <LocationMap
             office={{
@@ -357,7 +468,6 @@ const AttendanceForm: React.FC<AttendanceFormProps> = ({ offices, userId }) => {
         </div>
       )}
 
-      {/* ===== STATUS TERAKHIR ===== */}
       {lastAttendance && (
         <div className="last-attendance" style={{ marginTop: 14 }}>
           <h3>Status Terakhir</h3>
@@ -368,8 +478,7 @@ const AttendanceForm: React.FC<AttendanceFormProps> = ({ offices, userId }) => {
             <strong>Waktu:</strong> {new Date(lastAttendance.timestamp).toLocaleString("id-ID")}
           </p>
           <p>
-            <strong>Jarak ke kantor saat itu:</strong>{" "}
-            {Math.round(lastAttendance.distance_to_office_m)} m
+            <strong>Jarak ke kantor saat itu:</strong> {Math.round(lastAttendance.distance_to_office_m)} m
           </p>
         </div>
       )}
